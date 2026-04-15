@@ -1,78 +1,111 @@
 #include <stdint.h>
 #include <stdbool.h>
+#include <math.h>
 
-static inline float min(float a, float b)
+static inline float minf_custom(float a, float b)
 {
     return (a < b) ? a : b;
 }
 
-static inline float max(float a, float b)
+static inline float maxf_custom(float a, float b)
 {
     return (a > b) ? a : b;
+}
+
+static inline float clampf_custom(float x, float xmin, float xmax)
+{
+    return maxf_custom(xmin, minf_custom(x, xmax));
 }
 
 // #TODO
 // Function to recreate the Dynamic drive curve generator from Schwarzmuler Inverter 
 // refer to Bloc DDCG.pdf
-void torque_DDCG(float* torque, float* last_torque, float max_accel)
+void torque_DDCG(float* torque, float* last_torque, float max_accel, float degree)
 {
     float delta = *torque - *last_torque;
 
-    float step = delta * delta;
+    float step = powf(fabsf(delta), degree);
+    step = minf_custom(step, max_accel);
 
-    // limit step
-    step = min(step, max_accel);
+    float new_torque;
 
     if (delta > 0)
-    {
-        *torque = *last_torque + step;
-    }
+        new_torque = *last_torque + step;
     else if (delta < 0)
+        new_torque = *last_torque - step;
+    else
+        new_torque = *last_torque;
+
+    *torque = clampf_custom(new_torque, 0.0f, 100.0f);
+    *last_torque = *torque;
+}
+
+
+void computeTorqueAdjustments(
+    float ax,
+    float ay,
+    float steering_deg,
+    float yawRate_deg_s,
+
+    float *deltaYaw,
+    float *frontTorqueReduction,
+
+    float steering_gain,
+    float ay_gain,
+    float yaw_gain,
+
+    float steer_deadband_deg,
+    float ay_deadband,
+    float yaw_deadband_deg_s,
+    float deltaYaw_max,
+
+    float ax_deadband,
+    float maxAx,
+    float front_reduc_pct,
+
+    float torque_enable_threshold,
+    float torque_pct)
+{
+    float steering_used = steering_deg;
+    float ay_used = ay;
+    float ax_used = ax;
+
+    float yawRateTarget_deg_s;
+    float yawError_deg_s;
+
+    // Deadbands + enable
+    if (fabsf(steering_used) < steer_deadband_deg || torque_pct < torque_enable_threshold)
+        steering_used = 0.0f;
+
+    if (fabsf(ay_used) < ay_deadband || torque_pct < torque_enable_threshold)
+        ay_used = 0.0f;
+
+    // Target yaw from steering
+    yawRateTarget_deg_s = steering_gain * steering_used;
+
+    // Yaw error
+    yawError_deg_s = yawRateTarget_deg_s - yawRate_deg_s;
+
+    if (fabsf(yawError_deg_s) < yaw_deadband_deg_s || torque_pct < torque_enable_threshold)
+        yawError_deg_s = 0.0f;
+
+    // TV command = feedforward + feedback
+    float ff = ay_gain * ay_used;
+    float fb = yaw_gain * yawError_deg_s;
+
+    *deltaYaw = clampf_custom(ff + fb, -deltaYaw_max, deltaYaw_max);
+
+    // Front torque reduction
+    if (fabsf(ax_used) < ax_deadband || torque_pct < torque_enable_threshold)
+        ax_used = 0.0f;
+
+    if (ax_used > 0.0f)
     {
-        *torque = *last_torque - step;
+        float axNorm = clampf_custom(ax_used / maxAx, 0.0f, 1.0f);
+        *frontTorqueReduction = (front_reduc_pct * axNorm) / 100.0f;
     }
     else
     {
-        *torque = *last_torque;
+        *frontTorqueReduction = 0.0f;
     }
-}
-
-// Cahnged Macros to parameters for params
-// Compute torque vectoring correction and front wheel torque reduction
-void computeTorqueAdjustments(
-    float ax, float ay,              // Longitudinal and lateral acceleration [m/s^2]
-    float mass,                      // Vehicle mass [kg]
-    float cgHeight,                 // CG height [m]
-    float trackWidth,               // Track width [m]    
-    float wheelRadius,
-    float maxAx,                    // Max expected acceleration for scaling
-    float* deltaYaw,                // [out] torque delta for yaw correction
-    float* frontTorqueReduction,     // [out] torque reduction for front axle
-    float power_limiter_pct,         // power limiter [%]
-    float front_reduc_pct,           // max front torque reduction [%]
-    float max_torque,                // max torque [Nm]
-    float roll_to_yaw_gain)
-    {
-    // Roll moment calculation
-    float Mx = mass * ay * cgHeight;
-    float Mz = Mx * roll_to_yaw_gain; //misleading name should be changed
-    float torqueDiff = (Mz * 2 * wheelRadius) / trackWidth;
-    float torque1 = max_torque * power_limiter_pct;
-    float torque2 = max_torque * power_limiter_pct;
-    float torque3 = max_torque * power_limiter_pct;
-    float torque4 = max_torque * power_limiter_pct;
-    if (ay > 0){
-        *deltaYaw = (torqueDiff / max((torque2 + torque4), 1.0f)) * 100;
-    }
-    
-    if (ay < 0){
-        *deltaYaw = (torqueDiff / max((torque1 + torque3), 1.0f)) * 100;
-    }
-    *deltaYaw = max(-1.0f, min(1.0f, *deltaYaw));
-    // Front Torque Reduction from Longitudinal Acceleration 
-    // Normalize ax to [0, 1]
-    float axNorm = max(0, min(1, ax / maxAx));
-
-    // Define how much of front torque can be reduced at full acceleration
-    *frontTorqueReduction = (front_reduc_pct * axNorm) / 100;  // 0.0 to 0.3 (fraction of front torque)
 }
